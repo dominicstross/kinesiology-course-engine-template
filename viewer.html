@@ -557,18 +557,34 @@
 
     try {
       const cacheBust = Date.now();
-      const [resContent, resQuiz] = await Promise.all([
-        fetch(`content/ch${currentCh}/${currentMod}_content.json?t=${cacheBust}`),
-        fetch(`content/ch${currentCh}/${currentMod}_quiz.json?t=${cacheBust}`)
-      ]);
+      // Normalize ch format to padded 2-digit if folder is padded (e.g., '1' -> '01')
+      const chPadded = currentCh.toString().padStart(2, '0');
+      let resContent = await fetch(`content/ch${chPadded}/${currentMod}_content.json?t=${cacheBust}`);
+      if (!resContent.ok) {
+        // Fallback to unpadded ch if padded was not found
+        resContent = await fetch(`content/ch${currentCh}/${currentMod}_content.json?t=${cacheBust}`);
+      }
 
-      if (!resContent.ok || !resQuiz.ok) throw new Error(`Could not load files for Ch ${currentCh}, Module ${currentMod}`);
+      // Quiz is optional - don't let a missing quiz block the lesson content
+      let resQuiz = { ok: false };
+      try {
+        resQuiz = await fetch(`content/ch${chPadded}/${currentMod}_quiz.json?t=${cacheBust}`);
+        if (!resQuiz.ok) {
+          resQuiz = await fetch(`content/ch${currentCh}/${currentMod}_quiz.json?t=${cacheBust}`);
+        }
+      } catch (e) {
+        console.warn("No quiz file found for this module.");
+      }
 
-      moduleData = await resContent.json();
-      quizData = await resQuiz.json();
-
-      document.getElementById('moduleTitle').textContent = moduleData.meta.moduleTitle;
-      document.getElementById('courseTitle').textContent = moduleData.meta.course;
+        if (!resContent.ok) throw new Error(`Could not fetch content for Ch ${currentCh}, Module ${currentMod} (HTTP ${resContent.status})`);
+        moduleData = await resContent.json();
+        quizData = resQuiz.ok ? await resQuiz.json() : null;
+        const title = (moduleData.meta && moduleData.meta.moduleTitle) || moduleData.title || `Module ${currentMod}`;
+        const course = (moduleData.meta && moduleData.meta.course) || moduleData.course || moduleData.unit || 'KINS 2203';
+        const titleEl = document.getElementById('moduleTitle');
+        const courseEl = document.getElementById('courseTitle');
+        if (titleEl) titleEl.textContent = title;
+        if (courseEl) courseEl.textContent = course;
 
       buildPartPills();
       buildGlossary();
