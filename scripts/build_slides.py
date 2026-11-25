@@ -15,6 +15,11 @@ except ImportError:
     MSO_SHAPE_TYPE = None  # type: ignore
 
 try:
+    import fitz  # type: ignore  # PyMuPDF for direct NotebookLM PDF slide rendering
+except ImportError:
+    fitz = None  # type: ignore
+
+try:
     from PIL import Image  # type: ignore
 except ImportError:
     Image = None  # type: ignore
@@ -31,10 +36,38 @@ def find_repo_root(target_abs: str) -> str:
     return os.path.dirname(target_abs)
 
 
-def get_module_id(pptx_abs: str) -> str:
-    base_name = os.path.basename(pptx_abs)
+def get_module_id(deck_abs: str) -> str:
+    base_name = os.path.basename(deck_abs)
     m = re.match(r"^([0-9]+\.[0-9]+)", base_name)
     return m.group(1) if m else os.path.splitext(base_name)[0]
+
+
+def is_pdf_deck(deck_abs: str) -> bool:
+    return deck_abs.lower().endswith(".pdf")
+
+
+def get_pdf_page_count(pdf_abs: str) -> int:
+    if fitz is None or not os.path.exists(pdf_abs) or os.path.getsize(pdf_abs) == 0:
+        return 0
+    try:
+        with fitz.open(pdf_abs) as doc:
+            return len(doc)
+    except Exception:
+        return 0
+
+
+def count_companion_notes(chapter_dir: str, mod_id: str) -> Tuple[int, int]:
+    notes_json_path = os.path.join(chapter_dir, f"{mod_id}_notes.json")
+    if not os.path.exists(notes_json_path):
+        return (0, 0)
+    try:
+        with open(notes_json_path, "r", encoding="utf-8") as nf:
+            payload = json.load(nf)
+        items = payload if isinstance(payload, list) else payload.get("slides", [])
+        notes = sum(1 for item in items if str(item.get("transcript", "")).strip())
+        return (notes, len(items))
+    except Exception:
+        return (0, 0)
 
 
 def count_pptx_notes(pptx_abs: str) -> Tuple[int, int]:
@@ -58,27 +91,52 @@ def count_pptx_notes(pptx_abs: str) -> Tuple[int, int]:
         return (0, 0)
 
 
-def inspect_deck_status(pptx_abs: str) -> Dict[str, Any]:
-    chapter_dir = os.path.dirname(pptx_abs)
-    mod_id = get_module_id(pptx_abs)
+def get_source_slide_count(deck_abs: str) -> int:
+    if is_pdf_deck(deck_abs):
+        return get_pdf_page_count(deck_abs)
+    if Presentation is not None:
+        try:
+            return len(Presentation(deck_abs).slides)
+        except Exception:
+            return 0
+    return 0
+
+
+def inspect_deck_status(deck_abs: str) -> Dict[str, Any]:
+    chapter_dir = os.path.dirname(deck_abs)
+    mod_id = get_module_id(deck_abs)
     json_path = os.path.join(chapter_dir, f"{mod_id}_slides.json")
+    notes_json_path = os.path.join(chapter_dir, f"{mod_id}_notes.json")
     img_dir = os.path.join(chapter_dir, "images", mod_id)
     imgs = sorted(glob.glob(os.path.join(img_dir, "slide_*.*")))
 
-    pptx_mtime = os.path.getmtime(pptx_abs)
+    deck_mtime = os.path.getmtime(deck_abs)
+    notes_mtime = os.path.getmtime(notes_json_path) if os.path.exists(notes_json_path) else 0.0
+    latest_src_mtime = max(deck_mtime, notes_mtime)
     json_exists = os.path.exists(json_path)
 
     notes_count = 0
     total_slides = 0
 
+    def _fresh_counts() -> Tuple[int, int]:
+        if is_pdf_deck(deck_abs):
+            t_slides = get_pdf_page_count(deck_abs)
+            n_count, _ = count_companion_notes(chapter_dir, mod_id)
+            return (n_count, t_slides)
+        n_count, t_slides = count_pptx_notes(deck_abs)
+        if n_count == 0:
+            c_notes, _ = count_companion_notes(chapter_dir, mod_id)
+            n_count = c_notes
+        return (n_count, t_slides)
+
     if not json_exists:
         status = "NEW"
-        notes_count, total_slides = count_pptx_notes(pptx_abs)
+        notes_count, total_slides = _fresh_counts()
     else:
         json_mtime = os.path.getmtime(json_path)
-        if pptx_mtime > json_mtime or (imgs and pptx_mtime > min(os.path.getmtime(p) for p in imgs)):
+        if latest_src_mtime > json_mtime or (imgs and deck_mtime > min(os.path.getmtime(p) for p in imgs)):
             status = "NEEDS UPDATE"
-            notes_count, total_slides = count_pptx_notes(pptx_abs)
+            notes_count, total_slides = _fresh_counts()
         else:
             status = "UP TO DATE"
             try:
@@ -88,14 +146,14 @@ def inspect_deck_status(pptx_abs: str) -> Dict[str, Any]:
                 total_slides = len(slist)
                 notes_count = sum(1 for s in slist if str(s.get("transcript", "")).strip())
             except Exception:
-                notes_count, total_slides = count_pptx_notes(pptx_abs)
+                notes_count, total_slides = _fresh_counts()
 
     return {
-        "pptx_path": pptx_abs,
-        "repo_root": find_repo_root(pptx_abs),
+        "pptx_path": deck_abs,
+        "repo_root": find_repo_root(deck_abs),
         "chapter": os.path.basename(chapter_dir),
         "mod_id": mod_id,
-        "filename": os.path.basename(pptx_abs),
+        "filename": os.path.basename(deck_abs),
         "status": status,
         "png_count": len(imgs),
         "notes_count": notes_count,
@@ -109,13 +167,23 @@ def scan_decks(search_root: str) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     for root, dirs, files in os.walk(clean_root):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() not in ("node_modules", "__pycache__")]
+        deck_candidates: Dict[str, str] = {}
         for fname in sorted(files):
-            if fname.lower().endswith((".pptx", ".ppt")) and not fname.startswith("~$"):
+            lower = fname.lower()
+            if fname.startswith("~$"):
+                continue
+            if lower.endswith((".pptx", ".ppt", ".pdf")):
                 full_p = os.path.join(root, fname)
-                try:
-                    results.append(inspect_deck_status(full_p))
-                except Exception as exc:
-                    print(f"[SCAN WARN] Skipping {full_p}: {exc}")
+                mod_id = get_module_id(full_p)
+                # Prefer .pptx over .pdf if both exist for the same module ID
+                if mod_id not in deck_candidates or lower.endswith((".pptx", ".ppt")):
+                    deck_candidates[mod_id] = full_p
+        for mod_id in sorted(deck_candidates.keys()):
+            full_p = deck_candidates[mod_id]
+            try:
+                results.append(inspect_deck_status(full_p))
+            except Exception as exc:
+                print(f"[SCAN WARN] Skipping {full_p}: {exc}")
     return results
 
 
@@ -187,6 +255,55 @@ def export_single_slide_win32(pptx_abs_path: str, slide_index: int) -> bytes:
     finally:
         if os.path.exists(tmp_png):
             os.remove(tmp_png)
+
+
+def extract_pdf_metadata_and_media(
+    pdf_abs_path: str,
+    img_dir_abs: str,
+    export_media: bool = True,
+    img_format: str = "webp",
+    max_width: int = 1600,
+    quality: int = 85,
+) -> List[Dict[str, Any]]:
+    if fitz is None:
+        raise RuntimeError("PyMuPDF is not installed. Run: pip install pymupdf")
+    if not os.path.exists(pdf_abs_path) or os.path.getsize(pdf_abs_path) == 0:
+        raise RuntimeError(f"PDF file is empty or cloud-only in OneDrive: {pdf_abs_path}")
+
+    if export_media:
+        os.makedirs(img_dir_abs, exist_ok=True)
+        for old_file in glob.glob(os.path.join(img_dir_abs, "slide_*.*")):
+            os.remove(old_file)
+
+    slides_meta: List[Dict[str, Any]] = []
+    with fitz.open(pdf_abs_path) as doc:
+        for idx, page in enumerate(doc, start=1):
+            stem = f"slide_{idx:02d}"
+            image_filename = f"{stem}.{img_format}"
+            if export_media:
+                # Render at 2.0x scale (~1920px wide on standard 16:9 widescreen PDFs)
+                pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+                raw_png = pix.tobytes("png")
+                image_filename = save_optimized_image(
+                    raw_png,
+                    img_dir_abs,
+                    stem,
+                    original_ext="png",
+                    img_format=img_format,
+                    max_width=max_width,
+                    quality=quality,
+                )
+
+            slides_meta.append({
+                "index": idx,
+                "heading": f"Slide {idx}",
+                "bullets": [],
+                "transcript": "",
+                "youtube": "",
+                "image_filename": image_filename,
+            })
+
+    return slides_meta
 
 
 def extract_slide_metadata_and_media(
@@ -311,8 +428,41 @@ def extract_slide_metadata_and_media(
     return slides_meta
 
 
+def sync_companion_notes_json(deck_abs: str, chapter_dir: str, mod_id: str) -> int:
+    notes_json_path = os.path.join(chapter_dir, f"{mod_id}_notes.json")
+    if not os.path.exists(notes_json_path):
+        return 0
+    with open(notes_json_path, "r", encoding="utf-8") as nf:
+        payload = json.load(nf)
+    items = payload if isinstance(payload, list) else payload.get("slides", [])
+    by_idx = {int(item.get("index", i + 1)): item for i, item in enumerate(items)}
+
+    if not is_pdf_deck(deck_abs) and Presentation is not None:
+        prs = Presentation(deck_abs)
+        updated = 0
+        for idx, slide in enumerate(prs.slides, start=1):
+            entry = by_idx.get(idx)
+            if not entry:
+                continue
+            transcript = str(entry.get("transcript", "")).strip()
+            tf = slide.notes_slide.notes_text_frame
+            existing_tags = [
+                ln for ln in tf.text.splitlines()
+                if re.match(r"^\s*\[(youtube|full-slide)[^\]]*\]\s*$", ln, re.I)
+            ]
+            if "[full-slide]" not in [t.lower() for t in existing_tags]:
+                existing_tags.insert(0, "[full-slide]")
+            combined = "\n".join(existing_tags + ([transcript] if transcript else [])).strip()
+            if tf.text.strip() != combined:
+                tf.text = combined
+                updated += 1
+        if updated > 0:
+            prs.save(deck_abs)
+    return len(by_idx)
+
+
 def should_export_images(
-    pptx_abs: str,
+    deck_abs: str,
     img_dir_abs: str,
     out_json_path: str,
     force: bool,
@@ -325,27 +475,26 @@ def should_export_images(
     existing = sorted(glob.glob(os.path.join(img_dir_abs, "slide_*.*")))
     if not existing:
         return True
-    # Detect slide-count drift (e.g., swapping decks or adding/deleting slides)
-    if os.path.exists(out_json_path) and Presentation is not None:
+    if os.path.exists(out_json_path):
         try:
             with open(out_json_path, "r", encoding="utf-8") as jf:
                 prev_data = json.load(jf)
             prev_count = len(prev_data.get("slides", []))
-            curr_count = len(Presentation(pptx_abs).slides)
-            if prev_count > 0 and curr_count != prev_count:
+            curr_count = get_source_slide_count(deck_abs)
+            if prev_count > 0 and curr_count > 0 and curr_count != prev_count:
                 return True
             max_img_idx = max(
                 int(re.search(r"slide_(\d+)", os.path.basename(p)).group(1))
                 for p in existing
                 if re.search(r"slide_(\d+)", os.path.basename(p))
             )
-            if max_img_idx > curr_count:
+            if curr_count > 0 and max_img_idx > curr_count:
                 return True
         except Exception:
             pass
-    pptx_mtime = os.path.getmtime(pptx_abs)
+    deck_mtime = os.path.getmtime(deck_abs)
     oldest_mtime = min(os.path.getmtime(p) for p in existing)
-    return pptx_mtime > oldest_mtime
+    return deck_mtime > oldest_mtime
 
 
 def convert_deck(
@@ -364,27 +513,42 @@ def convert_deck(
         else:
             print(msg)
 
-    pptx_abs = os.path.abspath(pptx_path)
-    resolved_root = repo_root or find_repo_root(pptx_abs)
-    chapter_dir = os.path.dirname(pptx_abs)
+    deck_abs = os.path.abspath(pptx_path)
+    resolved_root = repo_root or find_repo_root(deck_abs)
+    chapter_dir = os.path.dirname(deck_abs)
     chapter_rel = os.path.relpath(chapter_dir, resolved_root).replace("\\", "/")
 
-    base_name = os.path.basename(pptx_abs)
-    mod_id = get_module_id(pptx_abs)
+    base_name = os.path.basename(deck_abs)
+    mod_id = get_module_id(deck_abs)
 
     img_dir_abs = os.path.join(chapter_dir, "images", mod_id)
     audio_dir_abs = os.path.join(chapter_dir, "audio", mod_id)
     out_json_path = os.path.join(chapter_dir, f"{mod_id}_slides.json")
+    notes_json_path = os.path.join(chapter_dir, f"{mod_id}_notes.json")
 
-    do_export = should_export_images(pptx_abs, img_dir_abs, out_json_path, force_images, text_only)
-    slides_meta = extract_slide_metadata_and_media(
-        pptx_abs,
-        img_dir_abs,
-        export_media=do_export,
-        img_format=img_format,
-        max_width=max_width,
-        quality=quality,
-    )
+    synced_nblm = sync_companion_notes_json(deck_abs, chapter_dir, mod_id)
+    if synced_nblm:
+        log(f"  [NBLM]   Loaded {synced_nblm} slide note(s) from {mod_id}_notes.json")
+
+    do_export = should_export_images(deck_abs, img_dir_abs, out_json_path, force_images, text_only)
+    if is_pdf_deck(deck_abs):
+        slides_meta = extract_pdf_metadata_and_media(
+            deck_abs,
+            img_dir_abs,
+            export_media=do_export,
+            img_format=img_format,
+            max_width=max_width,
+            quality=quality,
+        )
+    else:
+        slides_meta = extract_slide_metadata_and_media(
+            deck_abs,
+            img_dir_abs,
+            export_media=do_export,
+            img_format=img_format,
+            max_width=max_width,
+            quality=quality,
+        )
     total_slides = len(slides_meta)
 
     log(f"[PROCESSING] {base_name} (Module {mod_id}, {total_slides} slides)")
@@ -421,6 +585,17 @@ def convert_deck(
         except Exception:
             pass
 
+    nblm_by_idx: Dict[int, Dict[str, Any]] = {}
+    if os.path.exists(notes_json_path):
+        try:
+            with open(notes_json_path, "r", encoding="utf-8") as nf:
+                npayload = json.load(nf)
+            nitems = npayload if isinstance(npayload, list) else npayload.get("slides", [])
+            for i, item in enumerate(nitems, start=1):
+                nblm_by_idx[int(item.get("index", i))] = item
+        except Exception:
+            pass
+
     slides_output: List[Dict[str, Any]] = []
     notes_count = 0
     audio_count = 0
@@ -428,6 +603,7 @@ def convert_deck(
     for meta in slides_meta:
         idx = int(meta["index"])
         prev = existing_slides_by_idx.get(idx, {})
+        nblm_item = nblm_by_idx.get(idx, {})
 
         audio_rel = ""
         for ext in ("wav", "mp3", "m4a", "ogg"):
@@ -436,13 +612,20 @@ def convert_deck(
                 audio_rel = f"{chapter_rel}/audio/{mod_id}/slide_{idx:02d}.{ext}"
                 break
 
-        yt_val = str(meta["youtube"] or prev.get("youtube", ""))
+        yt_val = str(meta["youtube"] or nblm_item.get("youtube") or prev.get("youtube", ""))
         desc_val = str(prev.get("description", ""))
+        final_heading = str(nblm_item.get("heading") or meta["heading"]).strip()
+        final_bullets = (
+            nblm_item.get("bullets")
+            if isinstance(nblm_item.get("bullets"), list) and nblm_item.get("bullets")
+            else meta["bullets"]
+        )
+        final_transcript = str(nblm_item.get("transcript") or meta["transcript"]).strip()
 
         slide_entry: Dict[str, Any] = {
-            "heading": meta["heading"],
+            "heading": final_heading,
             "description": desc_val,
-            "bullets": meta["bullets"],
+            "bullets": final_bullets,
         }
 
         if yt_val:
@@ -455,13 +638,13 @@ def convert_deck(
                     img_file = os.path.basename(matches[0])
             if os.path.exists(os.path.join(img_dir_abs, img_file)):
                 slide_entry["image"] = f"{chapter_rel}/images/{mod_id}/{img_file}"
-                slide_entry["alt"] = str(prev.get("alt") or meta["heading"])
+                slide_entry["alt"] = str(prev.get("alt") or final_heading)
 
         if audio_rel:
             slide_entry["audio"] = audio_rel
             audio_count += 1
-        if meta["transcript"]:
-            slide_entry["transcript"] = meta["transcript"]
+        if final_transcript:
+            slide_entry["transcript"] = final_transcript
             notes_count += 1
 
         slides_output.append(slide_entry)
@@ -484,8 +667,8 @@ def convert_deck(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Universal .pptx to _slides.json converter for Kinesiology OLM repos")
-    parser.add_argument("target", help="Path to a chapter directory or a single .pptx file")
+    parser = argparse.ArgumentParser(description="Universal .pptx / .pdf to _slides.json converter for Kinesiology OLM repos")
+    parser.add_argument("target", help="Path to a chapter directory or a single .pptx/.pdf file")
     parser.add_argument("--force-images", action="store_true", help="Force re-extracting slide visuals")
     parser.add_argument("--text-only", action="store_true", help="Only update JSON text/notes/audio without extracting visuals")
     parser.add_argument("--format", default="webp", choices=["webp", "png", "jpg"], help="Output image format (default: webp)")
@@ -501,18 +684,21 @@ def main() -> None:
     repo_root = find_repo_root(target_abs)
     print(f"[REPO ROOT] {repo_root}")
 
-    if os.path.isfile(target_abs) and target_abs.lower().endswith(".pptx"):
-        pptx_files = [target_abs]
+    if os.path.isfile(target_abs) and target_abs.lower().endswith((".pptx", ".pdf")):
+        deck_files = [target_abs]
     else:
-        pptx_files = sorted(glob.glob(os.path.join(target_abs, "*.pptx")))
+        deck_files = sorted(
+            glob.glob(os.path.join(target_abs, "*.pptx"))
+            + glob.glob(os.path.join(target_abs, "*.pdf"))
+        )
 
-    if not pptx_files:
-        print(f"[ERROR] No .pptx files found at {target_abs}")
+    if not deck_files:
+        print(f"[ERROR] No .pptx or .pdf files found at {target_abs}")
         sys.exit(1)
 
-    for pptx in pptx_files:
+    for deck in deck_files:
         convert_deck(
-            pptx,
+            deck,
             repo_root,
             force_images=args.force_images,
             text_only=args.text_only,
