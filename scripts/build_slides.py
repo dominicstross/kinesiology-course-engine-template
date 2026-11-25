@@ -4,10 +4,8 @@ import io
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from pptx import Presentation  # type: ignore
@@ -39,6 +37,27 @@ def get_module_id(pptx_abs: str) -> str:
     return m.group(1) if m else os.path.splitext(base_name)[0]
 
 
+def count_pptx_notes(pptx_abs: str) -> Tuple[int, int]:
+    if Presentation is None or not os.path.exists(pptx_abs) or os.path.getsize(pptx_abs) == 0:
+        return (0, 0)
+    try:
+        prs = Presentation(pptx_abs)
+        total = len(prs.slides)
+        notes = 0
+        for slide in prs.slides:
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                txt = slide.notes_slide.notes_text_frame.text.strip()
+                cleaned = [
+                    ln for ln in txt.splitlines()
+                    if not re.match(r"^\s*\[(youtube|full-slide)[^\]]*\]\s*$", ln, re.I)
+                ]
+                if "\n".join(cleaned).strip():
+                    notes += 1
+        return (notes, total)
+    except Exception:
+        return (0, 0)
+
+
 def inspect_deck_status(pptx_abs: str) -> Dict[str, Any]:
     chapter_dir = os.path.dirname(pptx_abs)
     mod_id = get_module_id(pptx_abs)
@@ -49,16 +68,27 @@ def inspect_deck_status(pptx_abs: str) -> Dict[str, Any]:
     pptx_mtime = os.path.getmtime(pptx_abs)
     json_exists = os.path.exists(json_path)
 
+    notes_count = 0
+    total_slides = 0
+
     if not json_exists:
         status = "NEW"
+        notes_count, total_slides = count_pptx_notes(pptx_abs)
     else:
         json_mtime = os.path.getmtime(json_path)
-        if pptx_mtime > json_mtime:
+        if pptx_mtime > json_mtime or (imgs and pptx_mtime > min(os.path.getmtime(p) for p in imgs)):
             status = "NEEDS UPDATE"
-        elif imgs and pptx_mtime > min(os.path.getmtime(p) for p in imgs):
-            status = "NEEDS UPDATE"
+            notes_count, total_slides = count_pptx_notes(pptx_abs)
         else:
             status = "UP TO DATE"
+            try:
+                with open(json_path, "r", encoding="utf-8") as jf:
+                    jdata = json.load(jf)
+                slist = jdata.get("slides", [])
+                total_slides = len(slist)
+                notes_count = sum(1 for s in slist if str(s.get("transcript", "")).strip())
+            except Exception:
+                notes_count, total_slides = count_pptx_notes(pptx_abs)
 
     return {
         "pptx_path": pptx_abs,
@@ -68,6 +98,8 @@ def inspect_deck_status(pptx_abs: str) -> Dict[str, Any]:
         "filename": os.path.basename(pptx_abs),
         "status": status,
         "png_count": len(imgs),
+        "notes_count": notes_count,
+        "total_slides": total_slides,
         "json_exists": json_exists,
     }
 
@@ -96,7 +128,6 @@ def save_optimized_image(
     max_width: int = 1600,
     quality: int = 85,
 ) -> str:
-    """Resizes and compresses image bytes using Pillow; falls back to raw write if Pillow is absent."""
     fmt = img_format.lower().strip()
     if fmt == "jpeg":
         fmt = "jpg"
@@ -111,7 +142,6 @@ def save_optimized_image(
         return out_name
 
     with Image.open(io.BytesIO(raw_bytes)) as im:
-        # Preserve alpha channel for WebP/PNG; flatten to white only if saving as JPG
         if fmt == "jpg" and im.mode in ("RGBA", "LA", "P"):
             bg = Image.new("RGB", im.size, (255, 255, 255))
             bg.paste(im.convert("RGBA"), mask=im.convert("RGBA").split()[3])
@@ -119,7 +149,6 @@ def save_optimized_image(
         elif im.mode not in ("RGB", "RGBA"):
             im = im.convert("RGBA" if fmt in ("webp", "png") else "RGB")
 
-        # Downscale proportionally if wider than max_width
         if max_width > 0 and im.width > max_width:
             ratio = max_width / float(im.width)
             new_height = max(1, int(round(im.height * ratio)))
@@ -139,7 +168,6 @@ def save_optimized_image(
 
 
 def export_single_slide_win32(pptx_abs_path: str, slide_index: int) -> bytes:
-    """Renders a single slide via PowerPoint COM to a temp PNG and returns its bytes."""
     import tempfile
     import win32com.client  # type: ignore
 
@@ -172,20 +200,21 @@ def extract_slide_metadata_and_media(
     if Presentation is None or MSO_SHAPE_TYPE is None:
         raise RuntimeError("python-pptx is not installed. Run: pip install python-pptx")
 
+    if not os.path.exists(pptx_abs_path) or os.path.getsize(pptx_abs_path) == 0:
+        raise RuntimeError(f"File is empty or cloud-only in OneDrive: {pptx_abs_path}")
+    try:
+        with open(pptx_abs_path, "rb") as _chk:
+            _hdr = _chk.read(4)
+        if _hdr != b"PK\x03\x04":
+            raise RuntimeError("Not a valid .pptx OpenXML zip (close PowerPoint if open, or re-save legacy .ppt as .pptx).")
+    except PermissionError:
+        raise RuntimeError("File is currently open/locked in PowerPoint. Save and close PowerPoint first.")
+
     if export_media:
         os.makedirs(img_dir_abs, exist_ok=True)
         for old_file in glob.glob(os.path.join(img_dir_abs, "slide_*.*")):
             os.remove(old_file)
 
-    if not os.path.exists(pptx_abs_path) or os.path.getsize(pptx_abs_path) == 0:
-        raise RuntimeError(f'File is empty or cloud-only in OneDrive: {pptx_abs_path}')
-    try:
-        with open(pptx_abs_path, 'rb') as _chk:
-            _hdr = _chk.read(4)
-        if _hdr != b'PK\x03\x04':
-            raise RuntimeError('Not a valid .pptx OpenXML zip (close PowerPoint if open, or re-save legacy .ppt as .pptx).')
-    except PermissionError:
-        raise RuntimeError('File is currently open/locked in PowerPoint. Save and close PowerPoint first.')
     prs = Presentation(pptx_abs_path)
     slides_meta: List[Dict[str, Any]] = []
 
