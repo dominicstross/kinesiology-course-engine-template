@@ -17,8 +17,8 @@ class SlideStudioApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Kinesiology OLM Slide Studio - PPTX to JSON Converter")
-        self.root.geometry("1020x660")
-        self.root.minsize(880, 560)
+        self.root.geometry("1100x670")
+        self.root.minsize(920, 560)
 
         template_root = os.path.dirname(SCRIPT_DIR)
         default_workspace = os.path.dirname(template_root)
@@ -59,7 +59,13 @@ class SlideStudioApp:
         filter_frame.pack(fill=tk.X)
 
         ttk.Label(filter_frame, text="Show:").pack(side=tk.LEFT, padx=(0, 6))
-        for label, val in [("All Decks", "ALL"), ("New & Modified Only", "ACTIONABLE"), ("Up to Date", "UP TO DATE")]:
+        filter_options = [
+            ("All Decks", "ALL"),
+            ("New & Modified Only", "ACTIONABLE"),
+            ("Missing Notes Only", "MISSING_NOTES"),
+            ("Up to Date", "UP TO DATE"),
+        ]
+        for label, val in filter_options:
             ttk.Radiobutton(
                 filter_frame,
                 text=label,
@@ -74,7 +80,7 @@ class SlideStudioApp:
         tree_frame = ttk.Frame(self.root, padding=(12, 6))
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("status", "repo", "chapter", "module", "file", "pngs")
+        columns = ("status", "repo", "chapter", "module", "file", "pngs", "notes")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="extended")
         self.tree.heading("status", text="Status")
         self.tree.heading("repo", text="Repository")
@@ -82,13 +88,15 @@ class SlideStudioApp:
         self.tree.heading("module", text="Module")
         self.tree.heading("file", text="PowerPoint File")
         self.tree.heading("pngs", text="Exported Images")
+        self.tree.heading("notes", text="Speaker Notes")
 
-        self.tree.column("status", width=125, anchor=tk.CENTER)
-        self.tree.column("repo", width=185, anchor=tk.W)
-        self.tree.column("chapter", width=85, anchor=tk.CENTER)
-        self.tree.column("module", width=80, anchor=tk.CENTER)
-        self.tree.column("file", width=260, anchor=tk.W)
+        self.tree.column("status", width=120, anchor=tk.CENTER)
+        self.tree.column("repo", width=180, anchor=tk.W)
+        self.tree.column("chapter", width=80, anchor=tk.CENTER)
+        self.tree.column("module", width=75, anchor=tk.CENTER)
+        self.tree.column("file", width=250, anchor=tk.W)
         self.tree.column("pngs", width=115, anchor=tk.CENTER)
+        self.tree.column("notes", width=115, anchor=tk.CENTER)
 
         self.tree.tag_configure("NEW", background="#fef3c7", foreground="#92400e")
         self.tree.tag_configure("NEEDS UPDATE", background="#dbeafe", foreground="#1e40af")
@@ -187,19 +195,27 @@ class SlideStudioApp:
         new_count = sum(1 for d in self.decks if d["status"] == "NEW")
         mod_count = sum(1 for d in self.decks if d["status"] == "NEEDS UPDATE")
         ok_count = sum(1 for d in self.decks if d["status"] == "UP TO DATE")
+        no_notes_count = sum(1 for d in self.decks if d.get("notes_count", 0) < d.get("total_slides", 0))
 
         self.summary_label.config(
-            text=f"Total: {len(self.decks)}  |  New: {new_count}  |  Modified: {mod_count}  |  Up to Date: {ok_count}"
+            text=f"Total: {len(self.decks)}  |  New: {new_count}  |  Modified: {mod_count}  |  Need Notes: {no_notes_count}  |  Up to Date: {ok_count}"
         )
 
         for idx, d in enumerate(self.decks):
             status = d["status"]
+            n_cnt = d.get("notes_count", 0)
+            t_cnt = d.get("total_slides", 0)
+
             if mode == "ACTIONABLE" and status == "UP TO DATE":
                 continue
             if mode == "UP TO DATE" and status != "UP TO DATE":
                 continue
+            if mode == "MISSING_NOTES" and t_cnt > 0 and n_cnt >= t_cnt:
+                continue
 
             repo_name = os.path.basename(d["repo_root"])
+            notes_label = f"{n_cnt} / {t_cnt}" if t_cnt > 0 else "0 / ?"
+
             self.tree.insert(
                 "",
                 tk.END,
@@ -211,6 +227,7 @@ class SlideStudioApp:
                     d["mod_id"],
                     d["filename"],
                     f"{d['png_count']} slides" if d["png_count"] else "None",
+                    notes_label,
                 ),
                 tags=(status,),
             )
