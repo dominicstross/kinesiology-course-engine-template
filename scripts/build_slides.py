@@ -312,7 +312,11 @@ def extract_slide_metadata_and_media(
 
 
 def should_export_images(
-    pptx_abs: str, img_dir_abs: str, force: bool, text_only: bool
+    pptx_abs: str,
+    img_dir_abs: str,
+    out_json_path: str,
+    force: bool,
+    text_only: bool,
 ) -> bool:
     if text_only:
         return False
@@ -321,6 +325,24 @@ def should_export_images(
     existing = sorted(glob.glob(os.path.join(img_dir_abs, "slide_*.*")))
     if not existing:
         return True
+    # Detect slide-count drift (e.g., swapping decks or adding/deleting slides)
+    if os.path.exists(out_json_path) and Presentation is not None:
+        try:
+            with open(out_json_path, "r", encoding="utf-8") as jf:
+                prev_data = json.load(jf)
+            prev_count = len(prev_data.get("slides", []))
+            curr_count = len(Presentation(pptx_abs).slides)
+            if prev_count > 0 and curr_count != prev_count:
+                return True
+            max_img_idx = max(
+                int(re.search(r"slide_(\d+)", os.path.basename(p)).group(1))
+                for p in existing
+                if re.search(r"slide_(\d+)", os.path.basename(p))
+            )
+            if max_img_idx > curr_count:
+                return True
+        except Exception:
+            pass
     pptx_mtime = os.path.getmtime(pptx_abs)
     oldest_mtime = min(os.path.getmtime(p) for p in existing)
     return pptx_mtime > oldest_mtime
@@ -354,7 +376,7 @@ def convert_deck(
     audio_dir_abs = os.path.join(chapter_dir, "audio", mod_id)
     out_json_path = os.path.join(chapter_dir, f"{mod_id}_slides.json")
 
-    do_export = should_export_images(pptx_abs, img_dir_abs, force_images, text_only)
+    do_export = should_export_images(pptx_abs, img_dir_abs, out_json_path, force_images, text_only)
     slides_meta = extract_slide_metadata_and_media(
         pptx_abs,
         img_dir_abs,
