@@ -1,5 +1,6 @@
 ﻿import argparse
 import glob
+import io
 import json
 import os
 import re
@@ -14,6 +15,11 @@ try:
 except ImportError:
     Presentation = None  # type: ignore
     MSO_SHAPE_TYPE = None  # type: ignore
+
+try:
+    from PIL import Image  # type: ignore
+except ImportError:
+    Image = None  # type: ignore
 
 
 def find_repo_root(target_abs: str) -> str:
@@ -38,7 +44,7 @@ def inspect_deck_status(pptx_abs: str) -> Dict[str, Any]:
     mod_id = get_module_id(pptx_abs)
     json_path = os.path.join(chapter_dir, f"{mod_id}_slides.json")
     img_dir = os.path.join(chapter_dir, "images", mod_id)
-    pngs = sorted(glob.glob(os.path.join(img_dir, "slide_*.*")))
+    imgs = sorted(glob.glob(os.path.join(img_dir, "slide_*.*")))
 
     pptx_mtime = os.path.getmtime(pptx_abs)
     json_exists = os.path.exists(json_path)
@@ -49,7 +55,7 @@ def inspect_deck_status(pptx_abs: str) -> Dict[str, Any]:
         json_mtime = os.path.getmtime(json_path)
         if pptx_mtime > json_mtime:
             status = "NEEDS UPDATE"
-        elif pngs and pptx_mtime > min(os.path.getmtime(p) for p in pngs):
+        elif imgs and pptx_mtime > min(os.path.getmtime(p) for p in imgs):
             status = "NEEDS UPDATE"
         else:
             status = "UP TO DATE"
@@ -61,7 +67,7 @@ def inspect_deck_status(pptx_abs: str) -> Dict[str, Any]:
         "mod_id": mod_id,
         "filename": os.path.basename(pptx_abs),
         "status": status,
-        "png_count": len(pngs),
+        "png_count": len(imgs),
         "json_exists": json_exists,
     }
 
@@ -81,21 +87,87 @@ def scan_decks(search_root: str) -> List[Dict[str, Any]]:
     return results
 
 
-def export_single_slide_win32(pptx_abs_path: str, slide_index: int, out_png: str) -> None:
+def save_optimized_image(
+    raw_bytes: bytes,
+    out_dir_abs: str,
+    base_stem: str,
+    original_ext: str = "png",
+    img_format: str = "webp",
+    max_width: int = 1600,
+    quality: int = 85,
+) -> str:
+    """Resizes and compresses image bytes using Pillow; falls back to raw write if Pillow is absent."""
+    fmt = img_format.lower().strip()
+    if fmt == "jpeg":
+        fmt = "jpg"
+
+    if Image is None:
+        ext = original_ext.lower().lstrip(".")
+        if ext == "jpeg":
+            ext = "jpg"
+        out_name = f"{base_stem}.{ext}"
+        with open(os.path.join(out_dir_abs, out_name), "wb") as f:
+            f.write(raw_bytes)
+        return out_name
+
+    with Image.open(io.BytesIO(raw_bytes)) as im:
+        # Preserve alpha channel for WebP/PNG; flatten to white only if saving as JPG
+        if fmt == "jpg" and im.mode in ("RGBA", "LA", "P"):
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im.convert("RGBA"), mask=im.convert("RGBA").split()[3])
+            im = bg
+        elif im.mode not in ("RGB", "RGBA"):
+            im = im.convert("RGBA" if fmt in ("webp", "png") else "RGB")
+
+        # Downscale proportionally if wider than max_width
+        if max_width > 0 and im.width > max_width:
+            ratio = max_width / float(im.width)
+            new_height = max(1, int(round(im.height * ratio)))
+            im = im.resize((max_width, new_height), Image.Resampling.LANCZOS)
+
+        out_name = f"{base_stem}.{fmt}"
+        out_path = os.path.join(out_dir_abs, out_name)
+
+        if fmt == "webp":
+            im.save(out_path, format="WEBP", quality=quality, method=6)
+        elif fmt == "png":
+            im.save(out_path, format="PNG", optimize=True)
+        else:
+            im.save(out_path, format="JPEG", quality=quality, optimize=True)
+
+        return out_name
+
+
+def export_single_slide_win32(pptx_abs_path: str, slide_index: int) -> bytes:
+    """Renders a single slide via PowerPoint COM to a temp PNG and returns its bytes."""
+    import tempfile
     import win32com.client  # type: ignore
 
-    ppt_app = win32com.client.Dispatch("PowerPoint.Application")
-    presentation = ppt_app.Presentations.Open(
-        pptx_abs_path, ReadOnly=True, Untitled=False, WithWindow=False
-    )
+    fd, tmp_png = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
     try:
-        presentation.Slides(slide_index).Export(out_png, "PNG", 1920, 1080)
+        ppt_app = win32com.client.Dispatch("PowerPoint.Application")
+        presentation = ppt_app.Presentations.Open(
+            pptx_abs_path, ReadOnly=True, Untitled=False, WithWindow=False
+        )
+        try:
+            presentation.Slides(slide_index).Export(tmp_png, "PNG", 1920, 1080)
+        finally:
+            presentation.Close()
+        with open(tmp_png, "rb") as f:
+            return f.read()
     finally:
-        presentation.Close()
+        if os.path.exists(tmp_png):
+            os.remove(tmp_png)
 
 
 def extract_slide_metadata_and_media(
-    pptx_abs_path: str, img_dir_abs: str, export_media: bool = True
+    pptx_abs_path: str,
+    img_dir_abs: str,
+    export_media: bool = True,
+    img_format: str = "webp",
+    max_width: int = 1600,
+    quality: int = 85,
 ) -> List[Dict[str, Any]]:
     if Presentation is None or MSO_SHAPE_TYPE is None:
         raise RuntimeError("python-pptx is not installed. Run: pip install python-pptx")
@@ -156,27 +228,37 @@ def extract_slide_metadata_and_media(
 
         transcript = "\n".join(cleaned_note_lines).strip()
         image_filename = ""
+        stem = f"slide_{idx:02d}"
 
-        # Decide media strategy for this slide:
-        # 1. YouTube tag -> no static image needed
-        # 2. Exactly 1 picture & no charts/groups & not [full-slide] -> extract clean picture blob
-        # 3. Multiple pictures, charts, or [full-slide] -> export full slide PNG and suppress duplicate bullets
-        # 4. Text-only slide (0 pictures, 0 charts) -> centered text-only slide (no image)
         if not youtube_url:
             if len(pictures) == 1 and not has_charts_or_diagrams and not force_full_slide:
                 pic = pictures[0]
-                ext = pic.image.ext.lower()
-                if ext == "jpeg":
-                    ext = "jpg"
-                image_filename = f"slide_{idx:02d}.{ext}"
                 if export_media:
-                    with open(os.path.join(img_dir_abs, image_filename), "wb") as img_f:
-                        img_f.write(pic.image.blob)
+                    image_filename = save_optimized_image(
+                        pic.image.blob,
+                        img_dir_abs,
+                        stem,
+                        original_ext=pic.image.ext,
+                        img_format=img_format,
+                        max_width=max_width,
+                        quality=quality,
+                    )
+                else:
+                    image_filename = f"{stem}.{img_format}"
             elif len(pictures) > 1 or has_charts_or_diagrams or force_full_slide:
-                image_filename = f"slide_{idx:02d}.png"
                 if export_media:
-                    export_single_slide_win32(pptx_abs_path, idx, os.path.join(img_dir_abs, image_filename))
-                # Suppress duplicate right-side bullets when full slide canvas is rendered
+                    raw_png = export_single_slide_win32(pptx_abs_path, idx)
+                    image_filename = save_optimized_image(
+                        raw_png,
+                        img_dir_abs,
+                        stem,
+                        original_ext="png",
+                        img_format=img_format,
+                        max_width=max_width,
+                        quality=quality,
+                    )
+                else:
+                    image_filename = f"{stem}.{img_format}"
                 bullets = []
 
         slides_meta.append({
@@ -211,6 +293,9 @@ def convert_deck(
     repo_root: Optional[str] = None,
     force_images: bool = False,
     text_only: bool = False,
+    img_format: str = "webp",
+    max_width: int = 1600,
+    quality: int = 85,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     def log(msg: str) -> None:
@@ -232,13 +317,22 @@ def convert_deck(
     out_json_path = os.path.join(chapter_dir, f"{mod_id}_slides.json")
 
     do_export = should_export_images(pptx_abs, img_dir_abs, force_images, text_only)
-    slides_meta = extract_slide_metadata_and_media(pptx_abs, img_dir_abs, export_media=do_export)
+    slides_meta = extract_slide_metadata_and_media(
+        pptx_abs,
+        img_dir_abs,
+        export_media=do_export,
+        img_format=img_format,
+        max_width=max_width,
+        quality=quality,
+    )
     total_slides = len(slides_meta)
 
     log(f"[PROCESSING] {base_name} (Module {mod_id}, {total_slides} slides)")
     if do_export:
-        extracted_count = sum(1 for s in slides_meta if s["image_filename"])
-        log(f"  [IMAGES] Extracted {extracted_count} clean slide visual(s) -> {chapter_rel}/images/{mod_id}/")
+        exported_files = glob.glob(os.path.join(img_dir_abs, "slide_*.*"))
+        total_kb = sum(os.path.getsize(p) for p in exported_files) / 1024.0
+        fmt_note = img_format.upper() if Image is not None else "RAW (install Pillow for WebP)"
+        log(f"  [IMAGES] Saved {len(exported_files)} {fmt_note} visual(s) ({total_kb:.1f} KB total) -> {chapter_rel}/images/{mod_id}/")
     else:
         log("  [IMAGES] Up-to-date (skipped media extraction)")
 
@@ -294,7 +388,6 @@ def convert_deck(
         if yt_val:
             slide_entry["youtube"] = yt_val
         elif meta["image_filename"]:
-            # Find matching file on disk (supports .png, .jpg, .gif, etc.)
             img_file = meta["image_filename"]
             if not os.path.exists(os.path.join(img_dir_abs, img_file)):
                 matches = glob.glob(os.path.join(img_dir_abs, f"slide_{idx:02d}.*"))
@@ -335,6 +428,9 @@ def main() -> None:
     parser.add_argument("target", help="Path to a chapter directory or a single .pptx file")
     parser.add_argument("--force-images", action="store_true", help="Force re-extracting slide visuals")
     parser.add_argument("--text-only", action="store_true", help="Only update JSON text/notes/audio without extracting visuals")
+    parser.add_argument("--format", default="webp", choices=["webp", "png", "jpg"], help="Output image format (default: webp)")
+    parser.add_argument("--max-width", type=int, default=1600, help="Max image width in pixels (default: 1600)")
+    parser.add_argument("--quality", type=int, default=85, help="Compression quality 1-100 for WebP/JPG (default: 85)")
     args = parser.parse_args()
 
     target_abs = os.path.abspath(args.target)
@@ -355,7 +451,15 @@ def main() -> None:
         sys.exit(1)
 
     for pptx in pptx_files:
-        convert_deck(pptx, repo_root, force_images=args.force_images, text_only=args.text_only)
+        convert_deck(
+            pptx,
+            repo_root,
+            force_images=args.force_images,
+            text_only=args.text_only,
+            img_format=args.format,
+            max_width=args.max_width,
+            quality=args.quality,
+        )
 
     print("\n[ALL COMPLETE] Conversion finished.")
 

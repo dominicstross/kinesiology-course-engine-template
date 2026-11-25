@@ -17,8 +17,8 @@ class SlideStudioApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Kinesiology OLM Slide Studio - PPTX to JSON Converter")
-        self.root.geometry("980x640")
-        self.root.minsize(840, 540)
+        self.root.geometry("1020x660")
+        self.root.minsize(880, 560)
 
         template_root = os.path.dirname(SCRIPT_DIR)
         default_workspace = os.path.dirname(template_root)
@@ -27,13 +27,18 @@ class SlideStudioApp:
         self.filter_var = tk.StringVar(value="ALL")
         self.text_only_var = tk.BooleanVar(value=False)
         self.force_images_var = tk.BooleanVar(value=False)
+        self.format_var = tk.StringVar(value="webp")
 
         self.decks: List[Dict[str, Any]] = []
         self.is_running = False
 
         self._build_ui()
         self.refresh_decks()
-        self.root.bind('<FocusIn>', self._on_window_focus)
+        self.root.bind("<FocusIn>", self._on_window_focus)
+
+    def _on_window_focus(self, event: Any) -> None:
+        if event.widget == self.root and not self.is_running:
+            self.refresh_decks()
 
     def _build_ui(self) -> None:
         style = ttk.Style()
@@ -76,14 +81,14 @@ class SlideStudioApp:
         self.tree.heading("chapter", text="Chapter")
         self.tree.heading("module", text="Module")
         self.tree.heading("file", text="PowerPoint File")
-        self.tree.heading("pngs", text="Exported PNGs")
+        self.tree.heading("pngs", text="Exported Images")
 
         self.tree.column("status", width=125, anchor=tk.CENTER)
         self.tree.column("repo", width=185, anchor=tk.W)
         self.tree.column("chapter", width=85, anchor=tk.CENTER)
         self.tree.column("module", width=80, anchor=tk.CENTER)
         self.tree.column("file", width=260, anchor=tk.W)
-        self.tree.column("pngs", width=105, anchor=tk.CENTER)
+        self.tree.column("pngs", width=115, anchor=tk.CENTER)
 
         self.tree.tag_configure("NEW", background="#fef3c7", foreground="#92400e")
         self.tree.tag_configure("NEEDS UPDATE", background="#dbeafe", foreground="#1e40af")
@@ -109,18 +114,28 @@ class SlideStudioApp:
             text="Convert Selected",
             command=self.run_selected,
         )
-        self.btn_convert_selected.pack(side=tk.LEFT, padx=(0, 14))
+        self.btn_convert_selected.pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(ctrl_frame, text="Format:").pack(side=tk.LEFT, padx=(0, 4))
+        fmt_combo = ttk.Combobox(
+            ctrl_frame,
+            textvariable=self.format_var,
+            values=["webp", "png"],
+            width=6,
+            state="readonly",
+        )
+        fmt_combo.pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Checkbutton(
             ctrl_frame,
-            text="Text / Speaker Notes Only (Skip PNG Export)",
+            text="Text / Notes Only",
             variable=self.text_only_var,
             command=self._on_mode_toggle,
-        ).pack(side=tk.LEFT, padx=(0, 12))
+        ).pack(side=tk.LEFT, padx=(0, 10))
 
         ttk.Checkbutton(
             ctrl_frame,
-            text="Force Re-Render PNGs",
+            text="Force Re-Render Images",
             variable=self.force_images_var,
             command=self._on_force_toggle,
         ).pack(side=tk.LEFT)
@@ -138,10 +153,6 @@ class SlideStudioApp:
     def _on_force_toggle(self) -> None:
         if self.force_images_var.get():
             self.text_only_var.set(False)
-
-    def _on_window_focus(self, event: Any) -> None:
-        if event.widget == self.root and not self.is_running:
-            self.refresh_decks()
 
     def browse_folder(self) -> None:
         chosen = filedialog.askdirectory(initialdir=self.workspace_var.get(), title="Select Course Repos or Chapter Folder")
@@ -163,7 +174,6 @@ class SlideStudioApp:
             return
         try:
             self.decks = build_slides.scan_decks(target)
-            self.append_log(f"[SCAN] Found {len(self.decks)} presentation(s) in: {target}")
         except Exception as exc:
             self.append_log(f"[ERROR] Scan failed: {exc}")
             self.decks = []
@@ -234,9 +244,10 @@ class SlideStudioApp:
         self._set_busy(True)
         text_only = self.text_only_var.get()
         force_images = self.force_images_var.get()
+        img_format = self.format_var.get()
 
         def worker() -> None:
-            self.append_log(f"\n=== Starting batch conversion ({len(targets)} deck(s)) ===")
+            self.append_log(f"\n=== Starting batch conversion ({len(targets)} deck(s), format={img_format.upper()}) ===")
             for d in targets:
                 try:
                     build_slides.convert_deck(
@@ -244,6 +255,7 @@ class SlideStudioApp:
                         repo_root=d["repo_root"],
                         force_images=force_images,
                         text_only=text_only,
+                        img_format=img_format,
                         log_fn=self.append_log,
                     )
                 except Exception as exc:
