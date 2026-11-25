@@ -177,6 +177,15 @@ def extract_slide_metadata_and_media(
         for old_file in glob.glob(os.path.join(img_dir_abs, "slide_*.*")):
             os.remove(old_file)
 
+    if not os.path.exists(pptx_abs_path) or os.path.getsize(pptx_abs_path) == 0:
+        raise RuntimeError(f'File is empty or cloud-only in OneDrive: {pptx_abs_path}')
+    try:
+        with open(pptx_abs_path, 'rb') as _chk:
+            _hdr = _chk.read(4)
+        if _hdr != b'PK\x03\x04':
+            raise RuntimeError('Not a valid .pptx OpenXML zip (close PowerPoint if open, or re-save legacy .ppt as .pptx).')
+    except PermissionError:
+        raise RuntimeError('File is currently open/locked in PowerPoint. Save and close PowerPoint first.')
     prs = Presentation(pptx_abs_path)
     slides_meta: List[Dict[str, Any]] = []
 
