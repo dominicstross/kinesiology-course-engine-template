@@ -129,7 +129,14 @@ class SlideStudioApp:
             text="Refresh Downloads",
             command=self.run_refresh_downloads,
         )
-        self.btn_refresh_downloads.pack(side=tk.LEFT, padx=(0, 12))
+        self.btn_refresh_downloads.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.btn_open_downloads = ttk.Button(
+            ctrl_frame,
+            text="Open downloads/ Folder",
+            command=self.open_downloads_folder,
+        )
+        self.btn_open_downloads.pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Label(ctrl_frame, text="Format:").pack(side=tk.LEFT, padx=(0, 4))
         fmt_combo = ttk.Combobox(
@@ -253,6 +260,35 @@ class SlideStudioApp:
             messagebox.showinfo("All Up to Date", "All scanned PowerPoint decks are already converted and up to date!")
             return
         self._start_worker(targets)
+
+    def open_downloads_folder(self) -> None:
+        target_root = ""
+        selected_ids = self.tree.selection()
+        if selected_ids:
+            first_deck = self.decks[int(selected_ids[0])]
+            target_root = first_deck.get("repo_root", "")
+
+        if not target_root:
+            ws = os.path.abspath(self.workspace_var.get().strip())
+            if os.path.isdir(os.path.join(ws, "content")):
+                target_root = ws
+            else:
+                roots = sorted({os.path.abspath(d["repo_root"]) for d in getattr(self, "decks", []) if d.get("repo_root")})
+                if len(roots) == 1:
+                    target_root = roots[0]
+                elif len(roots) > 1:
+                    chosen = filedialog.askdirectory(initialdir=ws, title="Select Course Repository Folder")
+                    if not chosen:
+                        return
+                    target_root = chosen
+
+        if not target_root or not os.path.isdir(target_root):
+            messagebox.showwarning("No Course Repo Found", "Select a deck row or point Course Repos Folder to a course repository first.")
+            return
+
+        dl_dir = os.path.join(os.path.abspath(target_root), "downloads")
+        os.makedirs(dl_dir, exist_ok=True)
+        os.startfile(dl_dir)
 
     def run_refresh_downloads(self) -> None:
         from build_downloads import build_downloads
