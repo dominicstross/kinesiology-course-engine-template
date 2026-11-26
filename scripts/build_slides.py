@@ -658,6 +658,12 @@ def convert_deck(
 
     log(f"  [JSON]   Wrote {mod_id}_slides.json ({notes_count}/{total_slides} notes, {audio_count}/{total_slides} audio)")
 
+    try:
+        from build_downloads import build_downloads
+        build_downloads(resolved_root)
+    except Exception:
+        pass
+
     return {
         "mod_id": mod_id,
         "total_slides": total_slides,
@@ -712,3 +718,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
