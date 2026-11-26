@@ -122,7 +122,14 @@ class SlideStudioApp:
             text="Convert Selected",
             command=self.run_selected,
         )
-        self.btn_convert_selected.pack(side=tk.LEFT, padx=(0, 12))
+        self.btn_convert_selected.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.btn_refresh_downloads = ttk.Button(
+            ctrl_frame,
+            text="Refresh Downloads",
+            command=self.run_refresh_downloads,
+        )
+        self.btn_refresh_downloads.pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Label(ctrl_frame, text="Format:").pack(side=tk.LEFT, padx=(0, 4))
         fmt_combo = ttk.Combobox(
@@ -246,6 +253,44 @@ class SlideStudioApp:
             messagebox.showinfo("All Up to Date", "All scanned PowerPoint decks are already converted and up to date!")
             return
         self._start_worker(targets)
+
+    def run_refresh_downloads(self) -> None:
+        from build_downloads import build_downloads
+
+        roots = set()
+        for d in getattr(self, "decks", []):
+            if d.get("repo_root"):
+                roots.add(os.path.abspath(d["repo_root"]))
+
+        ws = os.path.abspath(self.workspace_var.get().strip())
+        if not roots and os.path.isdir(ws):
+            if os.path.isdir(os.path.join(ws, "content")):
+                roots.add(ws)
+            else:
+                for entry in os.listdir(ws):
+                    cand = os.path.join(ws, entry)
+                    if os.path.isdir(os.path.join(cand, "content")):
+                        roots.add(cand)
+
+        if not roots:
+            messagebox.showwarning("No Course Repo Found", "No course repository containing a 'content' folder was found under the selected path.")
+            return
+
+        updated = []
+        for r in sorted(roots):
+            try:
+                build_downloads(r)
+                repo_name = os.path.basename(r)
+                updated.append(repo_name)
+                if hasattr(self, "log"):
+                    self.log(f"[DOWNLOADS] Updated {repo_name}/downloads/manifest.json")
+                elif hasattr(self, "append_log"):
+                    self.append_log(f"[DOWNLOADS] Updated {repo_name}/downloads/manifest.json")
+            except Exception as exc:
+                messagebox.showerror("Downloads Error", f"Failed to build downloads for {r}:\n{exc}")
+                return
+
+        messagebox.showinfo("Downloads Refreshed", "Updated downloads/manifest.json for:\n• " + "\n• ".join(updated))
 
     def run_selected(self) -> None:
         if self.is_running:
